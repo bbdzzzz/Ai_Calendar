@@ -1,0 +1,292 @@
+```markdown
+# 🎓 毕业设计：AI语音日历系统完整开发规范文档
+
+## 一、 项目概述
+基于自然语言语音交互的智能日历系统。用户通过语音下达指令，后端ASR转文字后交由AI Agent解析，Agent生成日程配置及文字回复，后端将行程同步至数据库，并通过TTS将文字转码为语音流推回前端播放。
+
+## 二、 技术栈确认
+*   **前端**: Flutter (Dart), GetX, Dio, WebSocket, Hive, flutter_screenutil, Material 3
+*   **后端**: Python, FastAPI, Uvicorn, SQLAlchemy, WebSocket
+*   **数据库**: MySQL
+*   **部署**: 局域网 (IP直连通信)
+
+---
+
+## 三、 系统架构与通信协议
+
+系统采用 **RESTful + WebSocket** 双协议通信：
+*   **RESTful (Dio)**：负责常规CRUD、登录、获取周报等无状态请求。
+*   **WebSocket (WS)**：负责语音流上传、ASR结果流式返回、Agent文本/音频流式返回、行程实时推送。
+
+### 3.1 WebSocket 核心信令格式 (JSON)
+
+前后端及AI交互必须严格遵守以下信令规范：
+
+```json
+// 1. 前端 -> 后端：开始录音
+{"type": "audio_start", "payload": {"format": "pcm", "sample_rate": 16000}}
+
+// 2. 前端 -> 后端：录音二进制数据 (直接发送 Binary Frame，非JSON)
+
+// 3. 前端 -> 后端：结束录音
+{"type": "audio_end"}
+
+// 4. 后端 -> 前端：ASR中间识别结果 (流式)
+{"type": "asr_partial", "payload": {"text": "明天下午"}}
+
+// 5. 后端 -> 前端：ASR最终识别结果
+{"type": "asr_final", "payload": {"text": "明天下午3点开会"}}
+
+// 6. 后端 -> 前端：Agent文本回复 (流式分块)
+{"type": "agent_text_delta", "payload": {"delta": "好的，为您安排了..."}}
+
+// 7. 后端 -> 前端：Agent音频回复 (流式分块，直接发送 Binary Frame)
+
+// 8. 后端 -> 前端：Agent音频结束标识
+{"type": "agent_audio_done"}
+
+// 9. 后端 -> 前端：Agent发起行程配置 (核心同步信令)
+{"type": "event_upsert", "payload": {
+    "temp_id": "temp_12345", 
+    "title": "项目会议",
+    "start_time": "2025-05-20T15:00:00",
+    "end_time": "2025-05-20T16:00:00",
+    "location": "3号会议室",
+    "status": "tentative" 
+}}
+
+// 10. 前端 -> 后端：用户确认/修改行程
+{"type": "event_confirm", "payload": {"temp_id": "temp_12345", "confirmed": true}}
+```
+
+---
+
+## 四、 数据库设计 (MySQL)
+
+```sql
+-- 用户表
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    preferences JSON COMMENT '偏好：如工作时段、通勤时间',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 行程表
+CREATE TABLE events (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    start_time DATETIME NOT NULL,
+    end_time DATETIME NOT NULL,
+    location VARCHAR(255),
+    category VARCHAR(50) DEFAULT 'other',
+    priority VARCHAR(20) DEFAULT 'medium',
+    status VARCHAR(20) DEFAULT 'confirmed', -- confirmed / tentative / cancelled
+    source VARCHAR(20) DEFAULT 'manual', -- ai / manual
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    INDEX idx_user_time (user_id, start_time, end_time)
+);
+
+-- 对话记录表 (维护多轮对话上下文)
+CREATE TABLE conversations (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    role VARCHAR(20) NOT NULL, -- user / assistant / tool
+    content TEXT,
+    tool_calls JSON COMMENT 'Agent发出的工具调用JSON',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- 报告表
+CREATE TABLE reports (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    report_type VARCHAR(20) NOT NULL, -- weekly / monthly
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    summary TEXT COMMENT 'Markdown格式报告',
+    statistics JSON COMMENT '统计图表数据',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+```
+
+---
+
+## 五、 AI Agent 接口规范 (自由定义)
+
+先开发项目,开发完写出接口文档和功能定义后期二次开发,将文档写在AIAGENT文件夹
+
+### 5.1 Agent 输入
+```python
+class AgentInput(BaseModel):
+    user_id: int
+    current_query: str           # 用户当前ASR转写文本
+    conversation_history: list   # 往期对话 [{'role': 'user', 'content': '...'}, ...]
+    current_context: dict        # 当前时间及用户近期日程摘要 {'time': '...', 'events': [...]}
+```
+
+### 5.2 Agent 输出
+```python
+class AgentAction(BaseModel):
+    action_type: str             # 'text_reply' | 'create_event' | 'update_event' | 'delete_event'
+    text_response: str           # 回复用户的文本 (用于TTS)
+    event_data: Optional[dict]   # 行程数据 (当action_type涉及行程操作时必填，字段同event_upsert信令)
+```
+
+---
+
+## 六、 后端详细设计
+
+### 6.1 目录结构
+```text
+backend/
+├── main.py                  # FastAPI入口, 挂载路由和定时任务
+├── api/
+│   ├── deps.py              # 依赖注入 (DB session, 当前用户校验)
+│   └── v1/
+│       ├── auth.py          # 登录注册
+│       ├── events.py        # 行程CRUD (REST)
+│       └── reports.py       # 周报月报获取
+├── core/
+│   ├── config.py            # 配置项
+│   ├── security.py          # JWT
+│   └── database.py          # MySQL连接池
+├── models/                  # SQLAlchemy Models
+├── schemas/                 # Pydantic Models (请求/响应体)
+├── services/
+│   ├── asr_service.py       # 语音识别流处理
+│   ├── tts_service.py       # 文本转语音流处理
+│   └── event_engine.py      # 冲突检测与行程合并逻辑
+├── agent/
+│   ├── adapter.py           # 黑盒Agent适配器 (调用Agent，解析输出)
+│   └── prompts.py           # 构造AgentInput的上下文逻辑
+├── websocket/
+│   └── handler.py           # WS生命周期管理与状态机
+└── scheduler/
+    └── report_cron.py       # APScheduler定时生成周报逻辑
+```
+
+### 6.2 核心WebSocket状态机逻辑 (`websocket/handler.py`)
+
+```python
+# 伪代码示意
+async def handle_websocket(websocket: WebSocket, user_id: int):
+    await websocket.accept()
+    
+    while True:
+        msg = await websocket.receive()
+        
+        # 1. 接收开始录音信号
+        if msg["type"] == "audio_start":
+            asr_stream = asr_service.create_stream()
+            
+        # 2. 接收音频二进制流
+        elif msg["type"] == "binary":
+            asr_stream.feed(msg["bytes"])
+            partial_text = asr_stream.get_partial()
+            await websocket.send_json({"type": "asr_partial", "payload": {"text": partial_text}})
+            
+        # 3. 接收结束录音信号，开始Agent处理
+        elif msg["type"] == "audio_end":
+            final_text = asr_stream.finalize()
+            await websocket.send_json({"type": "asr_final", "payload": {"text": final_text}})
+            
+            # 构造上下文，调用Agent
+            agent_input = build_agent_input(user_id, final_text)
+            agent_output = agent.adapter.run(agent_input) 
+            
+            # 4. 处理Agent输出 - 行程同步
+            if agent_output.action_type in ['create_event', 'update_event']:
+                is_conflict = event_engine.check_conflict(user_id, agent_output.event_data)
+                if is_conflict:
+                    # 让Agent重新规划或修改状态为tentative
+                    pass
+                save_to_db(agent_output.event_data)
+                await websocket.send_json({"type": "event_upsert", "payload": agent_output.event_data})
+                
+            # 5. 处理Agent输出 - 语音回复 (后端TTS)
+            if agent_output.text_response:
+                # 流式TTS
+                async for audio_chunk in tts_service.stream(agent_output.text_response):
+                    await websocket.send_bytes(audio_chunk) # 发送音频二进制
+                await websocket.send_json({"type": "agent_audio_done"})
+```
+
+---
+
+## 七、 前端详细设计
+
+### 7.1 目录结构 (基于GetX规范)
+```text
+lib/
+├── app/
+│   ├── routes/              # GetX路由
+│   └── theme/               # M3 主题与screenutil配置
+├── models/                  # 实体类
+├── services/                # 核心基础服务
+│   ├── api_service.dart     # Dio封装 (REST)
+│   ├── ws_service.dart      # WebSocket长连接与信令分发
+│   ├── audio_recorder.dart  # 麦克风采集PCM流
+│   ├── audio_player.dart    # PCM流播放器
+│   └── local_db.dart        # Hive本地缓存
+├── controllers/             # GetxController业务逻辑
+│   ├── calendar_ctrl.dart   # 日历状态、行程列表
+│   ├── assistant_ctrl.dart  # 语音交互状态机、WS收发控制
+│   └── user_ctrl.dart       # 登录与偏好
+└── views/                   # UI界面
+    ├── calendar/            # 日/周/月视图组件
+    ├── assistant/           # 语音对话悬浮球/面板
+    └── profile/             # 设置与报告展示
+```
+
+### 7.2 核心交互流实现 (`assistant_ctrl.dart`)
+前端录音与播放的流水线设计：
+1. **录音流**：使用 `record` 插件获取PCM音频，通过 `WS` 的 `sink.add()` 每积累100ms数据发送一次二进制帧。
+2. **接收播放流**：WS接收到二进制帧时，送入 `AudioPlayer` 的缓冲区；收到 `agent_audio_done` 时停止播放。
+3. **即时渲染**：收到 `event_upsert` 时，通过 `calendar_ctrl` 将该事件以**半透明/虚线框**形式插入日历视图，用户确认后变实。
+
+### 7.3 Android局域网关键配置
+必须在 `android/app/src/main/AndroidManifest.xml` 中开启明文传输权限：
+```xml
+<application
+    ...
+    android:usesCleartextTraffic="true">
+```
+
+---
+
+## 八、 关键技术实现方案
+
+### 8.1 冲突检测算法 (`event_engine.py`)
+采用**区间重叠检测**算法：
+给定新事件 `New[S1, E1]`，查询DB中该用户同一天已有事件 `Old[S2, E2]`。
+重叠条件：`S1 < E2 AND S2 < E1`。
+若冲突，返回冲突事件列表，由后端决定是强行记为 `tentative` 还是让Agent重新规划。
+
+### 8.2 周报月报异步生成 (`scheduler/`)
+1. 集成 `APScheduler`。
+2. 每周日晚23:00触发任务，拉取用户本周行程。
+3. 统计各分类占比、会议总时长等形成JSON数据。
+4. 将数据喂给Agent，要求生成Markdown格式总结。
+5. 将结果存入 `reports` 表，前端请求时直接拉取，无需实时生成。
+
+---
+
+## 九,环境
+
+docker-mysql数据库连接信息
+主机：localhost
+端口：3306
+用户名：root
+密码：123456
+
+uv管理虚拟环境(pyproject.toml)
+asr采用funasr,paraformer-zh-streaming
+tts采用edge-tts
