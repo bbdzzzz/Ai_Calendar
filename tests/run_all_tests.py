@@ -19,6 +19,11 @@ TESTS = [
     ("08_WebSocket", "tests/test_08_websocket.py", True),
     ("09_周报生成", "tests/test_09_report.py", False),
     ("10_健康检查", "tests/test_10_health.py", True),
+    ("11_Agent工具定义", "tests/test_11_agent_tools.py", False),
+    ("12_工具执行器", "tests/test_12_tool_executor.py", False),
+    ("13_AgentPrompt", "tests/test_13_agent_prompts.py", False),
+    ("14_LLM客户端", "tests/test_14_agent_llm.py", False),
+    ("15_AgentReAct", "tests/test_15_agent_react.py", False),
 ]
 
 

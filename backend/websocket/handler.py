@@ -9,7 +9,6 @@ from backend.agent import adapter, prompts
 from backend.core.database import SessionLocal
 from backend.models.models import Conversation, Event
 from backend.schemas.agent import AgentAction
-from backend.schemas.event import EventUpsertWS
 from backend.services import asr_service, event_engine, tts_service
 
 logger = logging.getLogger(__name__)
@@ -20,7 +19,6 @@ class WSHandler:
         self.ws = websocket
         self.user_id = user_id
         self.asr_stream: asr_service.ASRStream | None = None
-        self._pending_events: dict[str, dict] = {}
 
     async def run(self):
         await self.ws.accept()
@@ -46,6 +44,8 @@ class WSHandler:
             await self._on_audio_end()
         elif msg_type == "event_confirm":
             await self._on_event_confirm(data.get("payload", {}))
+        elif msg_type == "text_message":
+            await self._on_text_message(data.get("payload", {}))
         else:
             logger.warning("未知信令类型: %s", msg_type)
 
@@ -73,13 +73,12 @@ class WSHandler:
             db.commit()
 
             agent_input = prompts.build_agent_input(db, self.user_id, final_text)
-            agent_output = await adapter.run(agent_input)
+            agent_output = await adapter.run(agent_input, db=db)
 
-            db.add(Conversation(user_id=self.user_id, role="assistant", content=agent_output.text_response))
-            db.commit()
+            self._save_conversation_history(db, agent_input, agent_output)
 
             if agent_output.action_type in ("create_event", "update_event") and agent_output.event_data:
-                await self._handle_event_action(db, agent_output)
+                await self._send_event_upsert(agent_output.event_data)
 
             if agent_output.text_response:
                 await self.ws.send_json({"type": "agent_text_delta", "payload": {"delta": agent_output.text_response}})
@@ -89,33 +88,32 @@ class WSHandler:
         finally:
             db.close()
 
-    async def _handle_event_action(self, db: Session, agent_output: AgentAction):
-        event_data = agent_output.event_data
-        start_time = datetime.fromisoformat(event_data["start_time"])
-        end_time = datetime.fromisoformat(event_data["end_time"])
+    def _save_conversation_history(self, db: Session, agent_input, agent_output: AgentAction):
+        for msg in agent_output.new_messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            tool_calls = None
 
-        conflicts = event_engine.check_conflict(db, self.user_id, start_time, end_time)
-        if conflicts:
-            event_data["status"] = "tentative"
+            if role == "assistant" and msg.get("tool_calls"):
+                tool_calls = msg["tool_calls"]
+            elif role == "tool":
+                tool_calls = {"tool_call_id": msg.get("tool_call_id", "")}
 
-        if agent_output.action_type == "create_event":
-            event = Event(user_id=self.user_id, **event_data)
-            db.add(event)
-            db.commit()
-            db.refresh(event)
-            self._pending_events[str(event.id)] = event_data
-            payload = {**event_data, "temp_id": str(event.id)}
-        else:
-            event_id = event_data.get("id")
-            event = db.query(Event).filter(Event.id == event_id, Event.user_id == self.user_id).first()
-            if event:
-                for k, v in event_data.items():
-                    if k != "id":
-                        setattr(event, k, v)
-                db.commit()
-                db.refresh(event)
-            payload = {**event_data, "temp_id": str(event.id) if event else "unknown"}
+            db.add(Conversation(
+                user_id=self.user_id,
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+            ))
 
+        db.commit()
+
+    async def _send_event_upsert(self, event_data: dict):
+        payload = {
+            **event_data,
+            "temp_id": str(event_data.get("id", "pending")),
+            "status": event_data.get("status", "tentative"),
+        }
         await self.ws.send_json({"type": "event_upsert", "payload": payload})
 
     async def _on_event_confirm(self, payload: dict):
@@ -130,3 +128,29 @@ class WSHandler:
         finally:
             db.close()
         logger.info("行程确认: temp_id=%s, confirmed=%s", temp_id, confirmed)
+
+    async def _on_text_message(self, payload: dict):
+        text = payload.get("text", "").strip()
+        if not text:
+            return
+
+        db = SessionLocal()
+        try:
+            db.add(Conversation(user_id=self.user_id, role="user", content=text))
+            db.commit()
+
+            agent_input = prompts.build_agent_input(db, self.user_id, text)
+            agent_output = await adapter.run(agent_input, db=db)
+
+            self._save_conversation_history(db, agent_input, agent_output)
+
+            if agent_output.action_type in ("create_event", "update_event") and agent_output.event_data:
+                await self._send_event_upsert(agent_output.event_data)
+
+            if agent_output.text_response:
+                await self.ws.send_json({"type": "agent_text_delta", "payload": {"delta": agent_output.text_response}})
+                async for audio_chunk in tts_service.stream_tts(agent_output.text_response):
+                    await self.ws.send_bytes(audio_chunk)
+                await self.ws.send_json({"type": "agent_audio_done"})
+        finally:
+            db.close()

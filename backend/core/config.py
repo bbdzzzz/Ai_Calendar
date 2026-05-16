@@ -13,6 +13,15 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
+    LLM_API_KEY: str = ""
+    LLM_BASE_URL: str = "https://api.deepseek.com"
+    LLM_MODEL: str = "deepseek-chat"
+    LLM_MAX_TOOL_ROUNDS: int = 5
+    LLM_TEMPERATURE: float = 0.3
+    LLM_MAX_TOKENS: int = 1024
+    LLM_HISTORY_WINDOW_MINUTES: int = 30
+    LLM_MAX_HISTORY_CHARS: int = 8000
+
     model_config = {"env_file": ".env", "extra": "ignore"}
 
 
